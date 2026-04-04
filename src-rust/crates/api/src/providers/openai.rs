@@ -138,8 +138,7 @@ impl OpenAiProvider {
         for msg in messages {
             match msg.role {
                 Role::User => {
-                    let content_value = Self::user_content_to_openai(&msg.content);
-                    result.push(json!({ "role": "user", "content": content_value }));
+                    Self::append_user_messages(&mut result, &msg.content);
                 }
                 Role::Assistant => {
                     let (text_content, tool_calls) =
@@ -167,21 +166,32 @@ impl OpenAiProvider {
         result
     }
 
-    /// Build the `content` value for a `role: user` message.
-    fn user_content_to_openai(content: &MessageContent) -> Value {
+    fn append_user_messages(result: &mut Vec<Value>, content: &MessageContent) {
         match content {
-            MessageContent::Text(t) => json!(t),
+            MessageContent::Text(text) => {
+                result.push(json!({ "role": "user", "content": text }));
+            }
             MessageContent::Blocks(blocks) => {
-                let parts: Vec<Value> = blocks
-                    .iter()
-                    .filter_map(|b| Self::user_block_to_openai_part(b))
-                    .collect();
-                if parts.len() == 1 {
-                    if let Some(s) = parts[0].as_str() {
-                        return json!(s.to_string());
+                let mut user_parts: Vec<Value> = Vec::new();
+                let flush_user_parts = |result: &mut Vec<Value>, parts: &mut Vec<Value>| {
+                    if !parts.is_empty() {
+                        result.push(json!({
+                            "role": "user",
+                            "content": std::mem::take(parts),
+                        }));
+                    }
+                };
+
+                for block in blocks {
+                    if let Some(tool_result) = Self::tool_result_to_openai_message(block) {
+                        flush_user_parts(result, &mut user_parts);
+                        result.push(tool_result);
+                    } else if let Some(part) = Self::user_block_to_openai_part(block) {
+                        user_parts.push(part);
                     }
                 }
-                json!(parts)
+
+                flush_user_parts(result, &mut user_parts);
             }
         }
     }
@@ -199,8 +209,8 @@ impl OpenAiProvider {
                 }))
             }
             ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                // Tool results from users become separate `role: tool` messages
-                // at the conversation level — handled in extract_tool_results.
+                // Tool results become separate `role: tool` messages at the
+                // conversation level — handled in append_user_messages.
                 let _ = (tool_use_id, content, is_error);
                 None
             }
@@ -271,39 +281,42 @@ impl OpenAiProvider {
             MessageContent::Blocks(b) => b,
         };
 
-        let mut results = Vec::new();
-        for block in blocks {
-            if let ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } = block
-            {
-                let text = match content {
-                    ToolResultContent::Text(t) => t.clone(),
-                    ToolResultContent::Blocks(inner) => inner
-                        .iter()
-                        .filter_map(|b| {
-                            if let ContentBlock::Text { text } = b {
-                                Some(text.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                };
-                let mut obj = serde_json::Map::new();
-                obj.insert("role".into(), json!("tool"));
-                obj.insert("tool_call_id".into(), json!(tool_use_id));
-                obj.insert("content".into(), json!(text));
-                if let Some(true) = is_error {
-                    obj.insert("is_error".into(), json!(true));
-                }
-                results.push(Value::Object(obj));
-            }
-        }
-        results
+        blocks
+            .iter()
+            .filter_map(Self::tool_result_to_openai_message)
+            .collect()
+    }
+
+    fn tool_result_to_openai_message(block: &ContentBlock) -> Option<Value> {
+        let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = block
+        else {
+            return None;
+        };
+
+        let text = match content {
+            ToolResultContent::Text(t) => t.clone(),
+            ToolResultContent::Blocks(inner) => inner
+                .iter()
+                .filter_map(|b| {
+                    if let ContentBlock::Text { text } = b {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+
+        Some(json!({
+            "role": "tool",
+            "tool_call_id": tool_use_id,
+            "content": text,
+        }))
     }
 
     /// Convert tool definitions to the OpenAI `tools` array format.
@@ -596,6 +609,55 @@ impl OpenAiProvider {
         }
 
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claurst_core::types::Message;
+
+    #[test]
+    fn user_tool_results_become_tool_messages() {
+        let messages = vec![
+            Message::assistant_blocks(vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: json!({ "q": "test" }),
+            }]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: ToolResultContent::Text("done".to_string()),
+                is_error: Some(false),
+            }]),
+        ];
+
+        let wire = OpenAiProvider::to_openai_messages(&messages, None);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("assistant"));
+        assert_eq!(wire[1].get("role").and_then(|v| v.as_str()), Some("tool"));
+        assert_eq!(wire[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_1"));
+        assert_eq!(wire[1].get("content").and_then(|v| v.as_str()), Some("done"));
+    }
+
+    #[test]
+    fn mixed_user_content_flushes_before_tool_result() {
+        let messages = vec![Message::user_blocks(vec![
+            ContentBlock::Text {
+                text: "preface".to_string(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "call_2".to_string(),
+                content: ToolResultContent::Text("ok".to_string()),
+                is_error: Some(false),
+            },
+        ])];
+
+        let wire = OpenAiProvider::to_openai_messages(&messages, None);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("user"));
+        assert_eq!(wire[1].get("role").and_then(|v| v.as_str()), Some("tool"));
+        assert_eq!(wire[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
     }
 }
 
